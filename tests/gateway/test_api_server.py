@@ -317,6 +317,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
+    app.router.add_get(
+        "/v1/responses/{response_id}/events",
+        adapter._handle_get_response_events,
+    )
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     return app
 
@@ -2330,3 +2334,346 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# ResponseStore event-log helpers (Phase 2 replay primitives)
+# ---------------------------------------------------------------------------
+
+
+class TestResponseStoreEventLog:
+    def test_append_and_get_events_preserves_order(self):
+        store = ResponseStore(max_size=10)
+        store.append_event("resp_1", 0, "response.created", {"x": 0})
+        store.append_event("resp_1", 1, "response.output_text.delta", {"x": 1})
+        store.append_event("resp_1", 2, "response.completed", {"x": 2})
+
+        events = store.get_events("resp_1")
+        assert [e["sequence_number"] for e in events] == [0, 1, 2]
+        assert [e["event_type"] for e in events] == [
+            "response.created",
+            "response.output_text.delta",
+            "response.completed",
+        ]
+        assert events[1]["data"] == {"x": 1}
+
+    def test_get_events_respects_after_cursor(self):
+        store = ResponseStore(max_size=10)
+        for seq in range(5):
+            store.append_event("resp_1", seq, "e", {"seq": seq})
+        tail = store.get_events("resp_1", after=2)
+        assert [e["sequence_number"] for e in tail] == [3, 4]
+
+    def test_append_event_is_idempotent_on_duplicate_seq(self):
+        store = ResponseStore(max_size=10)
+        store.append_event("resp_1", 0, "e", {"a": 1})
+        store.append_event("resp_1", 0, "e", {"a": 2})  # duplicate seq
+        events = store.get_events("resp_1")
+        assert len(events) == 1
+        assert events[0]["data"] == {"a": 1}  # first-write wins
+
+    def test_has_events_and_latest_event_sequence(self):
+        store = ResponseStore(max_size=10)
+        assert store.has_events("resp_x") is False
+        assert store.latest_event_sequence("resp_x") is None
+        store.append_event("resp_x", 0, "e", {})
+        store.append_event("resp_x", 7, "e", {})
+        assert store.has_events("resp_x") is True
+        assert store.latest_event_sequence("resp_x") == 7
+
+    def test_delete_response_clears_event_log(self):
+        store = ResponseStore(max_size=10)
+        store.put("resp_1", {"output": "done"})
+        store.append_event("resp_1", 0, "e", {})
+        store.append_event("resp_1", 1, "e", {})
+        assert store.has_events("resp_1") is True
+        store.delete("resp_1")
+        assert store.has_events("resp_1") is False
+        assert store.get("resp_1") is None
+
+    def test_lru_eviction_cascades_to_event_log(self):
+        store = ResponseStore(max_size=2)
+        store.put("resp_1", {"output": "one"})
+        store.append_event("resp_1", 0, "e", {})
+        store.put("resp_2", {"output": "two"})
+        store.append_event("resp_2", 0, "e", {})
+        # Adding a 3rd response evicts resp_1, including its event log
+        store.put("resp_3", {"output": "three"})
+        assert store.get("resp_1") is None
+        assert store.has_events("resp_1") is False
+        assert store.has_events("resp_2") is True
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/responses/{id}/events — replay + live-tail endpoint
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse_events(body: str):
+    """Parse an SSE body into a list of {event, data} dicts.
+
+    Silently skips keepalive and ``: stream closed`` comment lines as well
+    as any ``data:`` line that isn't valid JSON.  Order preserved.
+    """
+    out = []
+    current = {}
+    for line in body.splitlines():
+        if not line:
+            if current:
+                out.append(current)
+                current = {}
+            continue
+        if line.startswith("event:"):
+            current["event"] = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            raw = line[len("data:"):].strip()
+            try:
+                current["data"] = json.loads(raw)
+            except json.JSONDecodeError:
+                current["data"] = None
+        # ":" comment lines are ignored.
+    if current:
+        out.append(current)
+    return out
+
+
+class TestResponsesEventsReplay:
+    @pytest.mark.asyncio
+    async def test_events_replays_stored_events_after_completion(self, adapter):
+        """After a response is fully streamed, GET /events returns every
+        stored event in order and closes without hanging on a live tail."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hello")
+                    cb(" world")
+                return (
+                    {"final_response": "Hello world", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                post_resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True, "store": True},
+                )
+                body = await post_resp.text()
+
+            # Pick the response_id out of the response.created event.
+            response_id = None
+            for evt in _parse_sse_events(body):
+                data = evt.get("data") or {}
+                if data.get("type") == "response.created":
+                    response_id = data["response"]["id"]
+                    break
+            assert response_id is not None
+
+            # Now replay — the response is already completed.
+            replay = await cli.get(f"/v1/responses/{response_id}/events?after=-1")
+            assert replay.status == 200
+            assert "text/event-stream" in replay.headers.get("Content-Type", "")
+            replay_body = await replay.text()
+            events = [e for e in _parse_sse_events(replay_body) if e.get("data")]
+            # The first replayed event must be response.created with seq=0
+            assert events, "at least one replayed event expected"
+            first = events[0]
+            assert first["data"]["type"] == "response.created"
+            assert first["data"]["sequence_number"] == 0
+            # Sequence numbers strictly increase by 1 starting from 0.
+            seqs = [e["data"]["sequence_number"] for e in events]
+            assert seqs == list(range(len(seqs)))
+            # Terminal event is response.completed.
+            assert events[-1]["data"]["type"] == "response.completed"
+
+    @pytest.mark.asyncio
+    async def test_events_after_cursor_only_returns_newer_events(self, adapter):
+        """?after=N must only send events with sequence_number > N."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hello")
+                    cb(" world")
+                return (
+                    {"final_response": "Hello world", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                post_resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True, "store": True},
+                )
+                body = await post_resp.text()
+
+            # Find the response id and the top sequence number so we can
+            # request "give me nothing new" with after=max_seq.
+            events = [e for e in _parse_sse_events(body) if e.get("data")]
+            response_id = None
+            max_seq = -1
+            for e in events:
+                data = e["data"]
+                if data.get("type") == "response.created":
+                    response_id = data["response"]["id"]
+                seq = data.get("sequence_number")
+                if isinstance(seq, int) and seq > max_seq:
+                    max_seq = seq
+            assert response_id is not None
+            assert max_seq >= 0
+
+            # after=max_seq must return zero real events.
+            replay = await cli.get(f"/v1/responses/{response_id}/events?after={max_seq}")
+            assert replay.status == 200
+            replay_body = await replay.text()
+            replayed = [e for e in _parse_sse_events(replay_body) if e.get("data")]
+            assert replayed == [], f"expected no events, got {replayed!r}"
+
+            # after=0 must return every event with seq > 0 and none with seq == 0.
+            replay2 = await cli.get(f"/v1/responses/{response_id}/events?after=0")
+            body2 = await replay2.text()
+            replayed2 = [e for e in _parse_sse_events(body2) if e.get("data")]
+            assert replayed2, "some events should be replayed"
+            assert all(e["data"]["sequence_number"] > 0 for e in replayed2)
+
+    @pytest.mark.asyncio
+    async def test_events_returns_404_for_unknown_response(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/responses/resp_does_not_exist/events")
+            assert resp.status == 404
+            data = await resp.json()
+            assert data["error"]["code"] == "response_not_found"
+
+    @pytest.mark.asyncio
+    async def test_events_rejects_non_integer_after(self, adapter):
+        # Pre-populate the store so the id lookup won't 404 first.
+        adapter._response_store.put("resp_live", {"response": {"id": "resp_live"}})
+        adapter._response_store.append_event("resp_live", 0, "response.created", {})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/responses/resp_live/events?after=not-a-number")
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["code"] == "invalid_query_parameter"
+
+    @pytest.mark.asyncio
+    async def test_events_tails_live_stream_and_closes_on_completion(self, adapter):
+        """Subscribe to /events while the response is still streaming and
+        confirm we receive every live event + the terminal response.completed,
+        then the stream closes."""
+        app = _create_app(adapter)
+
+        # Gate the mock agent so the POST is still running when the
+        # replay client subscribes.
+        agent_gate = asyncio.Event()
+        created_seen = asyncio.Event()
+
+        async def _mock_run_agent(**kwargs):
+            cb = kwargs.get("stream_delta_callback")
+            # Stream 1 delta immediately so response.created fires and
+            # the response gets registered in _active_responses.
+            if cb:
+                cb("Hello")
+            # Signal the test it can issue the replay GET now.
+            created_seen.set()
+            # Wait for the test to subscribe.
+            await agent_gate.wait()
+            if cb:
+                cb(" world")
+            return (
+                {"final_response": "Hello world", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                # Kick off the streaming POST and an events GET in parallel.
+                async def _drive_post():
+                    r = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "go",
+                            "stream": True,
+                            "store": True,
+                        },
+                    )
+                    return await r.text()
+
+                post_task = asyncio.create_task(_drive_post())
+
+                # Wait until the agent has emitted response.created + the
+                # first delta, so the response_id is discoverable and the
+                # response is registered as active.
+                await asyncio.wait_for(created_seen.wait(), timeout=5.0)
+
+                # Find the response_id by peeking at the writer's own
+                # event log (guaranteed to contain response.created by now
+                # since that is the very first _write_event call).
+                for _ in range(50):
+                    ids = [rid for rid in adapter._active_responses.keys()]
+                    if ids:
+                        response_id = ids[0]
+                        break
+                    await asyncio.sleep(0.02)
+                else:
+                    raise AssertionError("response never became active")
+
+                # Subscribe to /events with a fresh cursor — we want the
+                # replay handler to relay every live event after this
+                # point, then the final response.completed, then close.
+                replay_task = asyncio.create_task(
+                    cli.get(f"/v1/responses/{response_id}/events?after=-1")
+                )
+                # Give the handler a moment to subscribe.
+                await asyncio.sleep(0.05)
+
+                # Let the agent finish.
+                agent_gate.set()
+
+                replay_resp = await asyncio.wait_for(replay_task, timeout=5.0)
+                assert replay_resp.status == 200
+                replay_body = await asyncio.wait_for(replay_resp.text(), timeout=5.0)
+                post_body = await asyncio.wait_for(post_task, timeout=5.0)
+
+            replay_events = [e for e in _parse_sse_events(replay_body) if e.get("data")]
+            post_events = [e for e in _parse_sse_events(post_body) if e.get("data")]
+
+            # Every sequence number the POST client saw must also appear
+            # in the replay stream exactly once (idempotency by seq).
+            post_seqs = [
+                e["data"]["sequence_number"]
+                for e in post_events
+                if "sequence_number" in e["data"]
+            ]
+            replay_seqs = [
+                e["data"]["sequence_number"]
+                for e in replay_events
+                if "sequence_number" in e["data"]
+            ]
+            assert replay_seqs == sorted(replay_seqs), "replay must be in order"
+            assert len(replay_seqs) == len(set(replay_seqs)), "no duplicate seqs"
+            for seq in post_seqs:
+                assert seq in replay_seqs, f"missing seq {seq} in replay"
+
+            # Replay stream must end with response.completed.
+            assert replay_events[-1]["data"]["type"] == "response.completed"
+
+    @pytest.mark.asyncio
+    async def test_events_stored_response_without_event_log_still_404s_unless_stored(self, adapter):
+        """A response stored via direct put() but without any event log
+        rows still allows a 200 empty replay (so legacy snapshots don't
+        accidentally 404).  The inverse — nothing stored, no events — is
+        the 404 path tested above."""
+        adapter._response_store.put("resp_legacy", {"response": {"id": "resp_legacy"}})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/responses/resp_legacy/events?after=-1")
+            assert resp.status == 200
+            body = await resp.text()
+            events = [e for e in _parse_sse_events(body) if e.get("data")]
+            assert events == []
+
