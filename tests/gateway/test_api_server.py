@@ -295,12 +295,18 @@ class TestAuth:
 
 
 def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
-    """Create an adapter with optional API key."""
+    """Create an adapter with optional API key.
+
+    ``cors_origins`` defaults to the empty string so tests are hermetic
+    and don't inherit ``API_SERVER_CORS_ORIGINS`` from the shell
+    environment (which would silently enable CORS for whatever origins
+    the developer happens to have configured locally).  Pass an explicit
+    list/tuple/string to enable CORS for a test.
+    """
     extra = {}
     if api_key:
         extra["key"] = api_key
-    if cors_origins is not None:
-        extra["cors_origins"] = cors_origins
+    extra["cors_origins"] = "" if cors_origins is None else cors_origins
     config = PlatformConfig(enabled=True, extra=extra)
     return APIServerAdapter(config)
 
