@@ -1449,63 +1449,152 @@ class TestResponsesStreaming:
         )
         assert "partial output" in output_text
 
-    @pytest.mark.asyncio
-    async def test_stream_client_disconnect_persists_incomplete_snapshot(self, adapter):
-        """Client disconnect (ConnectionResetError) during streaming must
-        persist an ``incomplete`` snapshot in ResponseStore.  Regression
-        for PR #15171."""
-        fake_request = MagicMock()
-        fake_request.headers = {}
+    async def test_stream_continues_after_client_disconnect_when_stored(self, adapter):
+        """Client disconnect mid-stream must NOT cancel the agent for
+        store=True runs. The response should still reach response.completed
+        and be persisted to ResponseStore so a later GET recovers it.
+        """
+        from aiohttp import web as _aw
 
-        write_call_count = {"n": 0}
+        original_write = _aw.StreamResponse.write
+        disconnect_after = {"count": 0, "trigger": 2}
 
-        class _DisconnectingStreamResponse:
-            async def prepare(self, req):
-                pass
+        async def _flaky_write(self, data, *args, **kwargs):
+            disconnect_after["count"] += 1
+            if disconnect_after["count"] > disconnect_after["trigger"]:
+                raise ConnectionResetError("simulated client disconnect")
+            return await original_write(self, data, *args, **kwargs)
 
-            async def write(self, payload):
-                # First two writes succeed (prepare + response.created).
-                # On the third write (a text delta), the "client"
-                # disconnects — simulate with ConnectionResetError.
-                write_call_count["n"] += 1
-                if write_call_count["n"] >= 3:
-                    raise ConnectionResetError("simulated client disconnect")
+        agent_ran_to_completion = asyncio.Event()
+        captured_response_id = {"value": None}
 
-        import gateway.platforms.api_server as api_mod
-        import queue as _q
-
-        stream_q: _q.Queue = _q.Queue()
-        stream_q.put("some streamed text")
-        stream_q.put(None)  # EOS sentinel
-
-        async def _agent_coro():
-            await asyncio.sleep(0.01)
-            return ({"final_response": "", "messages": [], "api_calls": 0},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-
-        agent_task = asyncio.ensure_future(_agent_coro())
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
-
-        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
-            await adapter._write_sse_responses(
-                request=fake_request,
-                response_id=response_id,
-                model="hermes-agent",
-                created_at=int(time.time()),
-                stream_q=stream_q,
-                agent_task=agent_task,
-                agent_ref=[None],
-                conversation_history=[],
-                user_message="will disconnect",
-                instructions=None,
-                conversation=None,
-                store=True,
-                session_id=None,
+        async def _mock_run_agent(**kwargs):
+            cb = kwargs.get("stream_delta_callback")
+            if cb:
+                # Yield control between deltas so the SSE loop has a chance
+                # to attempt a write and hit the simulated disconnect.
+                cb("Recovered")
+                await asyncio.sleep(0)
+                cb(" answer")
+                await asyncio.sleep(0)
+            agent_ran_to_completion.set()
+            return (
+                {"final_response": "Recovered answer", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
             )
 
-        stored = adapter._response_store.get(response_id)
-        assert stored is not None, "snapshot must survive client disconnect"
-        assert stored["response"]["status"] == "incomplete"
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent), \
+                 patch.object(_aw.StreamResponse, "write", _flaky_write):
+                # Fire the request — the stream will abort mid-way server-side
+                # but the agent should still run to completion for store=True.
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "will drop",
+                        "stream": True,
+                        "store": True,
+                    },
+                )
+                # Drain whatever events we did receive so we can record the id.
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = ""
+                for line in body.splitlines():
+                    if line.startswith("data: "):
+                        try:
+                            payload = json.loads(line[len("data: "):])
+                        except json.JSONDecodeError:
+                            continue
+                        if payload.get("type") == "response.created":
+                            captured_response_id["value"] = payload["response"]["id"]
+                            break
+
+            # Wait for the mocked agent to finish; without the fix the task
+            # would be cancelled by the disconnect handler and this would
+            # time out.
+            await asyncio.wait_for(agent_ran_to_completion.wait(), timeout=5.0)
+
+            assert captured_response_id["value"], "response.created must have been seen before the drop"
+
+            # Give the persistence branch a moment to finish writing after the
+            # agent task returned.
+            for _ in range(50):
+                if adapter._response_store.get(captured_response_id["value"]) is not None:
+                    break
+                await asyncio.sleep(0.05)
+
+            # GET /v1/responses/{id} returns the completed snapshot.
+            get_resp = await cli.get(f"/v1/responses/{captured_response_id['value']}")
+            assert get_resp.status == 200
+            data = await get_resp.json()
+            assert data["status"] == "completed"
+            assert data["output"][-1]["content"][0]["text"] == "Recovered answer"
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupts_agent_on_disconnect_when_not_stored(self, adapter):
+        """Legacy behavior for store=False: disconnect still cancels the
+        agent so we don't spend tokens on a response no one will read.
+        """
+        from aiohttp import web as _aw
+
+        original_write = _aw.StreamResponse.write
+        # Let a couple of writes through so the mocked agent task has time
+        # to populate agent_ref[0] with our fake before the drop fires.
+        disconnect_after = {"count": 0, "trigger": 2}
+
+        async def _flaky_write(self, data, *args, **kwargs):
+            disconnect_after["count"] += 1
+            if disconnect_after["count"] > disconnect_after["trigger"]:
+                raise ConnectionResetError("simulated client disconnect")
+            return await original_write(self, data, *args, **kwargs)
+
+        interrupted = asyncio.Event()
+
+        async def _mock_run_agent(**kwargs):
+            agent_ref = kwargs.get("agent_ref")
+
+            class _FakeAgent:
+                def interrupt(self, _reason):
+                    interrupted.set()
+
+            if isinstance(agent_ref, list):
+                agent_ref[0] = _FakeAgent()
+            # Push one delta so the SSE loop does a second write and crosses
+            # the disconnect trigger.
+            cb = kwargs.get("stream_delta_callback")
+            if cb:
+                cb("hi")
+            # Sleep long enough that cancellation actually wins the race.
+            await asyncio.sleep(5)
+            return (
+                {"final_response": "never sent", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent), \
+                 patch.object(_aw.StreamResponse, "write", _flaky_write):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "drop me",
+                        "stream": True,
+                        "store": False,
+                    },
+                )
+                try:
+                    await resp.read()
+                except Exception:
+                    pass
+
+            # interrupt() must have been invoked on the agent.
+            await asyncio.wait_for(interrupted.wait(), timeout=5.0)
 
 
 # ---------------------------------------------------------------------------

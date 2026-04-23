@@ -1206,14 +1206,18 @@ class APIServerAdapter(BasePlatformAdapter):
           shape as the non-streaming path for parity)
         - ``response.failed`` — terminal event on agent error
 
-        If the client disconnects mid-stream, ``agent.interrupt()`` is
-        called so the agent stops issuing upstream LLM calls, then the
-        asyncio task is cancelled.  When ``store=True`` an initial
-        ``in_progress`` snapshot is persisted immediately after
-        ``response.created`` and disconnects update it to an
-        ``incomplete`` snapshot so GET /v1/responses/{id} and
-        ``previous_response_id`` chaining still have something to
-        recover from.
+        When ``store=True`` an initial ``in_progress`` snapshot is persisted
+        immediately after ``response.created``. If the client disconnects
+        mid-stream, the agent is allowed to continue running so the completed
+        response is persisted to ``ResponseStore`` and can be recovered via
+        ``GET /v1/responses/{response_id}``. Server-side cancellation still
+        updates the snapshot to ``incomplete`` so GET /v1/responses/{id} and
+        ``previous_response_id`` chaining have something to recover from.
+
+        For ``store=False`` the legacy behavior is preserved: ``agent.interrupt()``
+        is called on disconnect so the agent stops issuing upstream LLM calls
+        and the asyncio task is cancelled — no token spend on a response no one
+        will ever read.
         """
         import queue as _q
 
@@ -1230,6 +1234,15 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Id"] = session_id
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+
+        # When `store=True` we want the run to complete and be persisted
+        # even if the client drops. This flag flips to False the first time
+        # a write raises a disconnect error; subsequent writes become no-ops
+        # and the main loop keeps draining the stream queue so the agent
+        # reaches its natural completion. The terminal persistence block
+        # still writes into ResponseStore so a later GET /v1/responses/{id}
+        # returns the completed snapshot.
+        client_connected = True
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -1254,13 +1267,41 @@ class APIServerAdapter(BasePlatformAdapter):
         message_output_index: Optional[int] = None
         message_opened = False
 
+        async def _safe_write(payload: bytes) -> None:
+            """Write to the client; flip ``client_connected=False`` on drop.
+
+            When ``store=True`` we want the loop to keep running after the
+            client disconnects so the response can be persisted.  This helper
+            turns disconnect-related ``response.write`` failures into a
+            silent transition rather than an exception that would abort the
+            whole coroutine and skip the persistence branch.
+
+            For ``store=False`` we re-raise so the outer exception handler
+            can interrupt the agent and cancel the task promptly.
+            """
+            nonlocal client_connected
+            if not client_connected:
+                return
+            try:
+                await response.write(payload)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as exc:
+                client_connected = False
+                if not store:
+                    raise
+                logger.info(
+                    "SSE client disconnected mid-stream; continuing agent run "
+                    "for store=True response %s (%s)",
+                    response_id,
+                    type(exc).__name__,
+                )
+
         async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
             nonlocal sequence_number
             if "sequence_number" not in data:
                 data["sequence_number"] = sequence_number
             sequence_number += 1
             payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-            await response.write(payload.encode())
+            await _safe_write(payload.encode())
 
         def _envelope(status: str) -> Dict[str, Any]:
             env: Dict[str, Any] = {
@@ -1518,7 +1559,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 break
                         break
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
-                        await response.write(b": keepalive\n\n")
+                        await _safe_write(b": keepalive\n\n")
                         last_activity = time.monotonic()
                     continue
 
@@ -1636,9 +1677,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            _persist_incomplete_if_needed()
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
+            # Only reached for ``store=False``: the _safe_write helper flips
+            # the connected flag silently when ``store=True``.  For ephemeral
+            # responses the user will never look at the output, so interrupt
+            # the agent to save tokens and cancel its task.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
