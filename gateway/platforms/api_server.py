@@ -10,6 +10,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+- POST /v1/runs/{run_id}/stop    — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -736,6 +737,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # block so GET /events can tell the response is over even if no
         # terminal event was persisted (e.g. agent task crashed hard).
         self._active_responses: Dict[str, bool] = {}
+        # Active run agent/task references for stop support
+        self._active_run_agents: Dict[str, Any] = {}
+        self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -856,6 +860,9 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
+        service_tier: Optional[str] = None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -884,6 +891,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
+        if reasoning_config is None:
+            reasoning_config = GatewayRunner._load_reasoning_config()
+        if service_tier is None:
+            service_tier = GatewayRunner._load_service_tier()
 
         agent = AIAgent(
             model=model,
@@ -896,6 +907,9 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            reasoning_callback=reasoning_callback,
+            reasoning_config=reasoning_config,
+            service_tier=service_tier,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -1317,6 +1331,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+
     async def _write_sse_responses(
         self,
         request: "web.Request",
@@ -1332,6 +1347,8 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation: Optional[str],
         store: bool,
         session_id: str,
+        include_reasoning: bool = False,
+        stream_reasoning: bool = False,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -1359,6 +1376,10 @@ class APIServerAdapter(BasePlatformAdapter):
         behavior is preserved: ``agent.interrupt()`` is called on disconnect so
         the agent stops issuing upstream LLM calls and the asyncio task is
         cancelled — no token spend on a response no one will ever read.
+        If the server-side task itself is cancelled (for example during
+        shutdown), an ``incomplete`` snapshot is persisted so
+        ``GET /v1/responses/{response_id}`` and ``previous_response_id``
+        chaining still have something to recover from.
         """
         import queue as _q
 
@@ -1407,6 +1428,7 @@ class APIServerAdapter(BasePlatformAdapter):
         message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
         message_output_index: Optional[int] = None
         message_opened = False
+        reasoning_delta_seen = False
 
         async def _safe_write(payload: bytes) -> None:
             """Write to the client; flip ``client_connected=False`` on drop.
@@ -1503,8 +1525,63 @@ class APIServerAdapter(BasePlatformAdapter):
             return env
 
         final_response_text = ""
+        result: Dict[str, Any] = {}
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        terminal_snapshot_persisted = False
+
+        def _persist_response_snapshot(
+            response_env: Dict[str, Any],
+            *,
+            conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
+        ) -> None:
+            if not store:
+                return
+            if conversation_history_snapshot is None:
+                conversation_history_snapshot = list(conversation_history)
+                conversation_history_snapshot.append({"role": "user", "content": user_message})
+            self._response_store.put(response_id, {
+                "response": response_env,
+                "conversation_history": conversation_history_snapshot,
+                "instructions": instructions,
+                "session_id": session_id,
+            })
+            if conversation:
+                self._response_store.set_conversation(conversation, response_id)
+
+        def _persist_incomplete_if_needed() -> None:
+            """Persist an ``incomplete`` snapshot if no terminal one was written.
+
+            Called from both the client-disconnect (``ConnectionResetError``)
+            and server-cancellation (``asyncio.CancelledError``) paths so
+            GET /v1/responses/{id} and ``previous_response_id`` chaining keep
+            working after abrupt stream termination.
+            """
+            if not store or terminal_snapshot_persisted:
+                return
+            incomplete_text = "".join(final_text_parts) or final_response_text
+            incomplete_items: List[Dict[str, Any]] = list(emitted_items)
+            if incomplete_text:
+                incomplete_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": incomplete_text}],
+                })
+            incomplete_env = _envelope("incomplete")
+            incomplete_env["output"] = incomplete_items
+            incomplete_env["usage"] = {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+            incomplete_history = list(conversation_history)
+            incomplete_history.append({"role": "user", "content": user_message})
+            if incomplete_text:
+                incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            _persist_response_snapshot(
+                incomplete_env,
+                conversation_history_snapshot=incomplete_history,
+            )
 
         # Mark the response as active so GET /v1/responses/{id}/events knows
         # it should tail live events rather than only replay stored ones.
@@ -1532,6 +1609,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "response.created",
                 "response": created_env,
             })
+            _persist_response_snapshot(created_env)
             last_activity = time.monotonic()
 
             async def _open_message_item() -> None:
@@ -1566,6 +1644,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "content_index": 0,
                     "delta": delta_text,
                     "logprobs": [],
+                })
+
+            async def _emit_reasoning_delta(delta_text: str) -> None:
+                nonlocal reasoning_delta_seen
+                if not (include_reasoning and stream_reasoning and delta_text):
+                    return
+                reasoning_delta_seen = True
+                await _write_event("hermes.reasoning.delta", {
+                    "type": "hermes.reasoning.delta",
+                    "response_id": response_id,
+                    "item_id": message_item_id,
+                    "delta": delta_text,
                 })
 
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
@@ -1688,6 +1778,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__reasoning_delta__":
+                        delta_text = payload.get("delta", "") if isinstance(payload, dict) else ""
+                        await _emit_reasoning_delta(delta_text)
                     # Unknown tags are silently ignored (forward-compat).
                 elif isinstance(it, str):
                     await _emit_text_delta(it)
@@ -1742,6 +1835,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
+            final_reasoning_text = self._extract_reasoning_text(result) if isinstance(result, dict) else ""
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -1766,6 +1860,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": msg_done_item,
                 })
 
+            if include_reasoning and stream_reasoning and reasoning_delta_seen:
+                await _write_event("hermes.reasoning.done", {
+                    "type": "hermes.reasoning.done",
+                    "response_id": response_id,
+                    "item_id": message_item_id,
+                })
+
             # Always append a final message item in the completed
             # response envelope so clients that only parse the terminal
             # payload still see the assistant text.  This mirrors the
@@ -1788,6 +1889,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                _failed_history = list(conversation_history)
+                _failed_history.append({"role": "user", "content": user_message})
+                if final_response_text or agent_error:
+                    _failed_history.append({
+                        "role": "assistant",
+                        "content": final_response_text or agent_error,
+                    })
+                _persist_response_snapshot(
+                    failed_env,
+                    conversation_history_snapshot=_failed_history,
+                )
+                terminal_snapshot_persisted = True
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -1800,28 +1913,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                if include_reasoning and final_reasoning_text:
+                    completed_env.setdefault("hermes", {})["reasoning"] = {
+                        "text": final_reasoning_text,
+                        "status": "completed",
+                    }
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                if isinstance(result, dict) and result.get("messages"):
+                    full_history.extend(result["messages"])
+                else:
+                    full_history.append({"role": "assistant", "content": final_response_text})
+                _persist_response_snapshot(
+                    completed_env,
+                    conversation_history_snapshot=full_history,
+                )
+                terminal_snapshot_persisted = True
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
                 })
-
-                # Persist for future chaining / GET retrieval, mirroring
-                # the batch path behavior.
-                if store:
-                    full_history = list(conversation_history)
-                    full_history.append({"role": "user", "content": user_message})
-                    if isinstance(result, dict) and result.get("messages"):
-                        full_history.extend(result["messages"])
-                    else:
-                        full_history.append({"role": "assistant", "content": final_response_text})
-                    self._response_store.put(response_id, {
-                        "response": completed_env,
-                        "conversation_history": full_history,
-                        "instructions": instructions,
-                        "session_id": session_id,
-                    })
-                    if conversation:
-                        self._response_store.set_conversation(conversation, response_id)
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Only reached for ``store=False``: the _safe_write helper flips
@@ -1841,11 +1952,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 except (asyncio.CancelledError, Exception):
                     pass
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+        except asyncio.CancelledError:
+            # Server-side cancellation (e.g. shutdown, request timeout) —
+            # persist an incomplete snapshot so GET /v1/responses/{id} and
+            # previous_response_id chaining still work, then re-raise so the
+            # runtime's cancellation semantics are respected.
+            _persist_incomplete_if_needed()
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE task cancelled")
+                except Exception:
+                    pass
+            if not agent_task.done():
+                agent_task.cancel()
+            logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
+            raise
         finally:
             # The response is no longer live.  Wake any /events subscribers
             # waiting on our queue so they can settle to a completed/failed
             # state (or, for store=False, give up cleanly).
             _finalize_active_response()
+
 
         return response
 
@@ -1872,6 +2000,14 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        hermes_options = body.get("hermes") if isinstance(body.get("hermes"), dict) else {}
+        reasoning_options = hermes_options.get("reasoning") if isinstance(hermes_options.get("reasoning"), dict) else {}
+        include_reasoning = bool(reasoning_options.get("include"))
+        stream_reasoning = bool(reasoning_options.get("stream"))
+
+        from gateway.run import GatewayRunner
+        reasoning_config = GatewayRunner._load_reasoning_config()
+        service_tier = GatewayRunner._load_service_tier()
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -1995,6 +2131,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
+            def _on_reasoning_delta(delta_text):
+                """Queue live reasoning deltas when the request opted in."""
+                if include_reasoning and stream_reasoning and delta_text:
+                    _stream_q.put(("__reasoning_delta__", {"delta": delta_text}))
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -2002,6 +2143,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                reasoning_callback=_on_reasoning_delta if include_reasoning else None,
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -2026,6 +2170,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation=conversation,
                 store=store,
                 session_id=session_id,
+                include_reasoning=include_reasoning,
+                stream_reasoning=stream_reasoning,
             )
 
         async def _compute_response():
@@ -2034,6 +2180,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2094,6 +2242,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        reasoning_text = self._extract_reasoning_text(result)
+        if include_reasoning and reasoning_text:
+            response_data.setdefault("hermes", {})["reasoning"] = {
+                "text": reasoning_text,
+                "status": "completed",
+            }
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -2621,6 +2775,24 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         return items
 
+    @staticmethod
+    def _extract_reasoning_text(result: Dict[str, Any]) -> str:
+        """Extract final reasoning text from an agent result if available."""
+        text = result.get("last_reasoning") or ""
+        if isinstance(text, str) and text.strip():
+            return text
+
+        messages = result.get("messages", [])
+        if not isinstance(messages, list):
+            return ""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            msg_reasoning = msg.get("reasoning")
+            if isinstance(msg_reasoning, str) and msg_reasoning.strip():
+                return msg_reasoning
+        return ""
+
     # ------------------------------------------------------------------
     # Agent execution
     # ------------------------------------------------------------------
@@ -2632,6 +2804,9 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
+        service_tier: Optional[str] = None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -2655,6 +2830,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                reasoning_callback=reasoning_callback,
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
@@ -2829,6 +3007,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
+                self._active_run_agents[run_id] = agent
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
@@ -2868,8 +3047,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     q.put_nowait(None)
                 except Exception:
                     pass
+                self._active_run_agents.pop(run_id, None)
+                self._active_run_tasks.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
+        self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -2928,6 +3110,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+
+        if agent is None and task is None:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        if agent is not None:
+            try:
+                agent.interrupt("Stop requested via API")
+            except Exception:
+                pass
+
+        if task is not None and not task.done():
+            task.cancel()
+            # Bounded wait: run_conversation() executes in the default
+            # executor thread which task.cancel() cannot preempt — we rely on
+            # agent.interrupt() above to break the loop. Cap the wait so a
+            # slow/unresponsive interrupt can't hang this handler.
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[api_server] stop for run %s timed out after 5s; "
+                    "agent may still be finishing the current step",
+                    run_id,
+                )
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        return web.json_response({"run_id": run_id, "status": "stopping"})
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -2942,6 +3162,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("[api_server] sweeping orphaned run %s", run_id)
                 self._run_streams.pop(run_id, None)
                 self._run_streams_created.pop(run_id, None)
+                self._active_run_agents.pop(run_id, None)
+                self._active_run_tasks.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -2981,6 +3203,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

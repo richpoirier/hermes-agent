@@ -207,8 +207,31 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_assistant_thread_context_changed(event, say):
                 await self._handle_assistant_thread_lifecycle_event(event)
 
-            # Register slash command handler
-            @self._app.command("/hermes")
+            # Register slash command handler(s)
+            #
+            # Every gateway command from COMMAND_REGISTRY is a native Slack
+            # slash, matching Discord and Telegram's model (e.g. /btw, /stop,
+            # /model work directly without /hermes prefix). A single regex
+            # matcher dispatches all of them to one handler so we don't need
+            # N identical @app.command() decorators.
+            #
+            # The slash commands must ALSO be declared in the Slack app
+            # manifest (see `hermes slack manifest`). In Socket Mode, Slack
+            # routes the command event through the socket regardless of the
+            # manifest's request URL, but it will not deliver an event for
+            # a slash command the manifest doesn't declare.
+            from hermes_cli.commands import slack_native_slashes
+            import re as _re
+
+            _slash_names = [name for name, _d, _h in slack_native_slashes()]
+            if _slash_names:
+                _slash_pattern = _re.compile(
+                    r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
+                )
+            else:  # pragma: no cover - registry always non-empty
+                _slash_pattern = _re.compile(r"^/hermes$")
+
+            @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
                 await ack()
                 await self._handle_slash_command(command)
@@ -427,8 +450,18 @@ class SlackAdapter(BasePlatformAdapter):
         """
         # When reply_in_thread is disabled (default: True for backward compat),
         # only thread messages that are already part of an existing thread.
+        # For top-level channel messages, the inbound handler sets
+        # metadata.thread_id to the message's own ts as a session-keying
+        # fallback (see the `thread_ts = event.get("thread_ts") or ts` branch),
+        # so metadata alone can't distinguish a real thread reply from a
+        # top-level message. reply_to is the incoming message's own id, so
+        # when thread_id == reply_to the "thread" is synthetic and we reply
+        # directly in the channel instead.
         if not self.config.extra.get("reply_in_thread", True):
-            existing_thread = (metadata or {}).get("thread_id") or (metadata or {}).get("thread_ts")
+            md = metadata or {}
+            existing_thread = md.get("thread_id") or md.get("thread_ts")
+            if existing_thread and reply_to and existing_thread == reply_to:
+                existing_thread = None
             return existing_thread or None
 
         if metadata:
@@ -1100,6 +1133,8 @@ class SlackAdapter(BasePlatformAdapter):
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
+            elif self._slack_strict_mention() and not is_mentioned:
+                return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -1122,8 +1157,11 @@ class SlackAdapter(BasePlatformAdapter):
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
-            # Register this thread so all future messages auto-trigger the bot
-            if event_thread_ts:
+            # Register this thread so all future messages auto-trigger the bot.
+            # Skipped in strict mode: strict_mention=true bots must be
+            # re-mentioned every turn, so remembering the thread would
+            # defeat the feature (and re-enable agent-to-agent ack loops).
+            if event_thread_ts and not self._slack_strict_mention():
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[:self._MENTIONED_THREADS_MAX // 2]
@@ -1561,7 +1599,20 @@ class SlackAdapter(BasePlatformAdapter):
             return ""
 
     async def _handle_slash_command(self, command: dict) -> None:
-        """Handle /hermes slash command."""
+        """Handle Slack slash commands.
+
+        Every gateway command in COMMAND_REGISTRY is registered as a native
+        Slack slash (``/btw``, ``/stop``, ``/model``, etc.), matching the
+        Discord and Telegram model. The slash name itself is the command;
+        any text after it is the argument list.
+
+        The legacy ``/hermes <subcommand> [args]`` form is preserved for
+        backward compatibility with older workspace manifests and for users
+        who want a single entry point for free-form questions (``/hermes
+        what's the weather`` — non-slash text is treated as a regular
+        message).
+        """
+        slash_name = (command.get("command") or "").lstrip("/").strip()
         text = command.get("text", "").strip()
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
@@ -1571,20 +1622,25 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        # Map subcommands to gateway commands — derived from central registry.
-        # Also keep "compact" as a Slack-specific alias for /compress.
-        from hermes_cli.commands import slack_subcommand_map
-        subcommand_map = slack_subcommand_map()
-        subcommand_map["compact"] = "/compress"
-        first_word = text.split()[0] if text else ""
-        if first_word in subcommand_map:
-            # Preserve arguments after the subcommand
-            rest = text[len(first_word):].strip()
-            text = f"{subcommand_map[first_word]} {rest}".strip() if rest else subcommand_map[first_word]
-        elif text:
-            pass  # Treat as a regular question
+        if slash_name in ("hermes", ""):
+            # Legacy /hermes <subcommand> [args] routing + free-form questions.
+            # Empty slash_name falls into this branch for backward compat
+            # with any caller that didn't populate command["command"].
+            from hermes_cli.commands import slack_subcommand_map
+            subcommand_map = slack_subcommand_map()
+            subcommand_map["compact"] = "/compress"
+            first_word = text.split()[0] if text else ""
+            if first_word in subcommand_map:
+                rest = text[len(first_word):].strip()
+                text = f"{subcommand_map[first_word]} {rest}".strip() if rest else subcommand_map[first_word]
+            elif text:
+                pass  # Treat as a regular question
+            else:
+                text = "/help"
         else:
-            text = "/help"
+            # Native slash — /<slash_name> [args].  Route directly through the
+            # gateway command dispatcher by prepending the slash.
+            text = f"/{slash_name} {text}".strip()
 
         source = self.build_source(
             chat_id=channel_id,
@@ -1731,6 +1787,18 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() not in ("false", "0", "no", "off")
             return bool(configured)
         return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
+
+    def _slack_strict_mention(self) -> bool:
+        """When true, channel threads require an explicit @-mention on every
+        message. Disables all auto-triggers (mentioned-thread memory,
+        bot-message follow-up, session-presence). Defaults to False.
+        """
+        configured = self.config.extra.get("strict_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in ("true", "1", "yes", "on")
+            return bool(configured)
+        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""
